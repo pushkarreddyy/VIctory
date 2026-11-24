@@ -1813,6 +1813,70 @@ impl Host {
             }
         }
     }
+
+    /// Step 1 of unified title memory (#407): capability probe and allocation of
+    /// a unified buffer in an L0 write-back custom heap with UAV support.
+    pub fn unified_buffer(
+        &self,
+        size: u64,
+        flags: D3D12_RESOURCE_FLAGS,
+    ) -> Option<(ID3D12Resource, *mut u8, u64)> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: flags | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation and mapping of a CPU-visible buffer with UAV support.
+        let made = unsafe {
+            self.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buffer,
+                )
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    b.Map(0, None, Some(&mut data))
+                })
+        };
+        match made {
+            Ok(()) => {
+                let res = buffer?;
+                // SAFETY: valid resource pointer.
+                let gpu_va = unsafe { res.GetGPUVirtualAddress() };
+                Some((res, data.cast(), gpu_va))
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, size, "unified buffer unsupported or refused");
+                None
+            }
+        }
+    }
+
+    /// Probes whether the host device supports unified CPU/GPU write-back buffers.
+    pub fn supports_unified_memory(&self) -> bool {
+        self.unified_buffer(65536, D3D12_RESOURCE_FLAG_NONE).is_some()
+    }
 }
 
 /// For adapters without device-removed data (the software one): the last
