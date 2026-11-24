@@ -628,6 +628,7 @@ pub extern "system" fn XMemMapPhysicalPages(
 
 /// One page at each address; null `pages`, or a page number 0, unmaps
 /// (Grand Theft Auto VI passes 0 for addresses to clear).
+/// Contiguous runs of addresses and pages are coalesced into single multi-page mappings.
 pub extern "system" fn XMemMapPhysicalPagesScatter(
     addresses: *const *mut c_void,
     n: usize,
@@ -636,20 +637,44 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     if addresses.is_null() {
         return 0;
     }
-    for i in 0..n {
-        // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
-        let (address, page) = unsafe {
-            (
-                *addresses.add(i),
-                if pages.is_null() || *pages.add(i) == 0 {
-                    std::ptr::null()
+    let mut i = 0;
+    while i < n {
+        let addr = unsafe { *addresses.add(i) };
+        if pages.is_null() || unsafe { *pages.add(i) } == 0 {
+            let mut run = 1;
+            while i + run < n {
+                let next_addr = unsafe { *addresses.add(i + run) };
+                if (pages.is_null() || unsafe { *pages.add(i + run) } == 0)
+                    && next_addr as usize == (addr as usize + run * PAGE)
+                {
+                    run += 1;
                 } else {
-                    pages.add(i)
-                },
-            )
-        };
-        if XMemMapPhysicalPages(address, 1, page).is_null() {
-            return 0;
+                    break;
+                }
+            }
+            if XMemMapPhysicalPages(addr, run, std::ptr::null()).is_null() {
+                return 0;
+            }
+            i += run;
+        } else {
+            let mut run = 1;
+            let start_page = unsafe { *pages.add(i) };
+            while i + run < n {
+                let next_addr = unsafe { *addresses.add(i + run) };
+                let next_page = unsafe { *pages.add(i + run) };
+                if next_addr as usize == (addr as usize + run * PAGE)
+                    && next_page == start_page + run
+                {
+                    run += 1;
+                } else {
+                    break;
+                }
+            }
+            let page_ptr = unsafe { pages.add(i) };
+            if XMemMapPhysicalPages(addr, run, page_ptr).is_null() {
+                return 0;
+            }
+            i += run;
         }
     }
     1
@@ -659,31 +684,41 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// in place of what `to` shows; `from` 0 unmaps. The GPU's page-mapping
 /// copies (`victory_gpu`, queue `CopyPageMappingsBatchX`): Grand Theft Auto
 /// VI maps pages into a pool view, then has the GPU map them into its tiled
-/// heap. Page by page; false if a source page is not mapped physical memory.
+/// heap. Coalesces contiguous slices of source views into single multi-page views.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
     unmap(&mut physical, to, len);
-    for k in (0..len).step_by(PAGE) {
-        if from == 0 {
-            break;
-        }
+    if from == 0 {
+        return true;
+    }
+    let mut k = 0;
+    while k < len {
         let at = from + k;
-        let Some(slice) = physical
+        let Some((base, size, slice)) = physical
             .views
             .range(..=at)
             .next_back()
-            .filter(|(base, (size, _))| at < *base + size)
-            .map(|(base, (_, s))| Slice {
-                index: s.index + (at - base) / PAGE,
-                section: s.section.clone(),
+            .filter(|(b, (sz, _))| at < **b + sz)
+            .map(|(b, (sz, s))| {
+                (
+                    *b,
+                    *sz,
+                    Slice {
+                        index: s.index + (at - *b) / PAGE,
+                        section: s.section.clone(),
+                    },
+                )
             })
         else {
             return false;
         };
-        if !map(&mut physical, to + k, PAGE, slice) {
+        let view_avail = (base + size) - at;
+        let run = view_avail.min(len - k);
+        if !map(&mut physical, to + k, run, slice) {
             return false;
         }
+        k += run;
     }
     true
 }
