@@ -100,13 +100,62 @@ impl Heap {
     }
 }
 
+#[cfg(windows)]
+fn alloc_apu_memory(apu: u32, size: usize, layout: Layout) -> *mut u8 {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+    };
+    // SAFETY: Attempt to map memory at device address `apu` so CPU accesses to APU device
+    // addresses (e.g. memset/direct buffer writes by title audio threads) succeed directly.
+    let ptr = unsafe {
+        VirtualAlloc(
+            apu as *mut c_void,
+            size,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE,
+        )
+    };
+    if ptr.is_null() {
+        // Fallback to heap if VirtualAlloc at fixed low address is unavailable.
+        // SAFETY: non-zero size.
+        unsafe { std::alloc::alloc_zeroed(layout) }
+    } else {
+        ptr.cast()
+    }
+}
+
+#[cfg(not(windows))]
+fn alloc_apu_memory(_apu: u32, _size: usize, layout: Layout) -> *mut u8 {
+    // SAFETY: non-zero size.
+    unsafe { std::alloc::alloc_zeroed(layout) }
+}
+
+#[cfg(windows)]
+fn free_apu_memory(ptr: *mut u8, apu: u32, layout: Layout) {
+    use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+    if ptr as usize == apu as usize {
+        // SAFETY: allocated by VirtualAlloc at this exact address.
+        unsafe {
+            VirtualFree(ptr.cast(), 0, MEM_RELEASE);
+        }
+    } else {
+        // SAFETY: allocated by std::alloc with this layout.
+        unsafe { std::alloc::dealloc(ptr, layout) };
+    }
+}
+
+#[cfg(not(windows))]
+fn free_apu_memory(ptr: *mut u8, _apu: u32, layout: Layout) {
+    // SAFETY: allocated by std::alloc with this layout.
+    unsafe { std::alloc::dealloc(ptr, layout) };
+}
+
 /// Zeroed host memory and its device address.
 fn heap_alloc(size: usize, align: usize) -> Option<(*mut u8, u32)> {
     let layout = Layout::from_size_align(size.max(1), align.max(16)).ok()?;
     let mut heap = lock(&HEAP);
     let apu = heap.take(u32::try_from(layout.size()).ok()?, align as u32)?;
-    // SAFETY: non-zero size.
-    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    let ptr = alloc_apu_memory(apu, layout.size(), layout);
     if ptr.is_null() {
         heap.give_back(apu, apu + layout.size() as u32);
         return None;
@@ -124,9 +173,10 @@ fn heap_free(ptr: *mut u8) {
     };
     heap.by_apu.remove(&block.apu);
     heap.give_back(block.apu, block.apu + block.layout.size() as u32);
+    let apu = block.apu;
+    let layout = block.layout;
     drop(heap);
-    // SAFETY: allocated by `heap_alloc` with this layout.
-    unsafe { std::alloc::dealloc(ptr, block.layout) };
+    free_apu_memory(ptr, apu, layout);
 }
 
 /// Sizes the heap once, before anything is allocated from it. The console
@@ -492,9 +542,10 @@ impl Xma {
         let start = Instant::now();
         let mut active = 0;
         for index in 0..self.voices.len() as u32 {
-            if let (Some(context), Some(voice)) =
-                (self.context(index), &mut *lock(&self.voices[index as usize]))
-            {
+            if let (Some(context), Some(voice)) = (
+                self.context(index),
+                &mut *lock(&self.voices[index as usize]),
+            ) {
                 pump(context, voice);
                 active += 1;
             }
@@ -643,7 +694,10 @@ fn dump_input(index: u32, context: Context) {
     );
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::write(dir.join(format!("{n:02}-{index}.ctx")), words);
-    let _ = std::fs::write(dir.join(format!("{n:02}-{index}.xma")), input.unwrap_or_default());
+    let _ = std::fs::write(
+        dir.join(format!("{n:02}-{index}.xma")),
+        input.unwrap_or_default(),
+    );
 }
 
 /// Starts the decoding thread on the first enabled voice, and has it fill
@@ -1163,5 +1217,18 @@ mod tests {
         assert_eq!((m.message_count)(acp), 1, "disconnected");
         (m.release)(acp);
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+    }
+
+    #[test]
+    fn apu_alloc_memory_is_accessible() {
+        let (ptr, apu) = heap_alloc(0x1000, 64).expect("heap_alloc");
+        assert!(!ptr.is_null());
+        assert!(apu >= APU_BASE);
+        // SAFETY: allocated buffer is 0x1000 bytes.
+        unsafe {
+            ptr.write_bytes(0x55, 0x1000);
+            assert_eq!(*ptr, 0x55);
+        }
+        heap_free(ptr);
     }
 }
