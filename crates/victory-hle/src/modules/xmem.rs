@@ -184,6 +184,7 @@ pub extern "system" fn XMemVirtualQuery(
     address: *const c_void,
     out: *mut BasicInformation,
 ) -> BOOL {
+    flush_pending_mappings();
     let size = size_of::<MEMORY_BASIC_INFORMATION>();
     // SAFETY: the title passes room for the whole structure; the host
     // fails on a null one.
@@ -364,12 +365,67 @@ struct Slice {
     index: usize,
 }
 
+struct PendingMap {
+    base: usize,
+    n: usize,
+    slice: Slice,
+    thread_id: u32,
+}
+
 #[derive(Default)]
 struct Physical {
     next_page: usize,
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
+    pending: Option<PendingMap>,
+}
+
+fn flush_pending(physical: &mut Physical) {
+    if let Some(pending) = physical.pending.take() {
+        unmap(physical, pending.base, pending.n * PAGE);
+        map(physical, pending.base, pending.n * PAGE, pending.slice);
+    }
+}
+
+pub(crate) fn flush_pending_mappings() {
+    let mut physical = physical();
+    flush_pending(&mut physical);
+}
+
+static INSTALL_VEH: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+fn install_map_handler() {
+    INSTALL_VEH.get_or_init(|| {
+        use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
+        // SAFETY: registration of our demand-paging VEH handler.
+        unsafe { AddVectoredExceptionHandler(1, Some(on_map_fault)) };
+    });
+}
+
+unsafe extern "system" fn on_map_fault(
+    info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+) -> i32 {
+    use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+    };
+
+    let r = unsafe { &*(*info).ExceptionRecord };
+    if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS || r.NumberParameters < 2 {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let fault_addr = r.ExceptionInformation[1] as usize;
+    let mut physical = physical();
+    if let Some(pending) = physical.pending.take() {
+        let in_range = fault_addr >= pending.base && fault_addr < pending.base + pending.n * PAGE;
+        unmap(&mut physical, pending.base, pending.n * PAGE);
+        let ok = map(&mut physical, pending.base, pending.n * PAGE, pending.slice);
+        if in_range && ok {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    EXCEPTION_CONTINUE_SEARCH
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -456,6 +512,7 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
         return 0;
     }
     let mut physical = physical();
+    flush_pending(&mut physical);
     for i in 0..n {
         // SAFETY: the title passes `n` page numbers.
         physical.pages.remove(&unsafe { *pages.add(i) });
@@ -539,6 +596,7 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
 /// costs a map, a commit and an unmap (which flushes every core's TLB).
 /// False if a page is unknown or the host fails.
 pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> bool {
+    flush_pending_mappings();
     let Some(runs) = runs(pages, offset, data.len()) else {
         return false;
     };
@@ -589,41 +647,83 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
 
 /// Maps `n` pages at `address`, in place of what is mapped there; null
 /// `pages` unmaps. Returns `address`, or null if a page or the host fails.
+/// Contiguous runs across subsequent calls on the same thread are coalesced into
+/// single multi-page views, slashing syscall overhead during bulk initialization.
 pub extern "system" fn XMemMapPhysicalPages(
     address: *mut c_void,
     n: usize,
     pages: *const usize,
 ) -> *mut c_void {
+    install_map_handler();
     let base = address as usize;
     let mut physical = physical();
-    unmap(&mut physical, base, n * PAGE);
-    if pages.is_null() {
+    if pages.is_null() || n == 0 {
+        flush_pending(&mut physical);
+        unmap(&mut physical, base, n * PAGE);
         return address;
     }
     // SAFETY: the title passes `n` page numbers.
-    let pages = unsafe { std::slice::from_raw_parts(pages, n) };
-    let mut i = 0;
-    while i < n {
-        let Some(first) = physical.pages.get(&pages[i]).cloned() else {
-            tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page");
-            return std::ptr::null_mut();
-        };
-        // One view per run of consecutive slices of one section.
-        let run = 1 + pages[i + 1..]
-            .iter()
-            .zip(1..)
-            .take_while(|&(page, k)| {
-                physical.pages.get(page).is_some_and(|s| {
-                    Arc::ptr_eq(&s.section, &first.section) && s.index == first.index + k
-                })
-            })
-            .count();
-        if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
-            return std::ptr::null_mut();
+    let page_slice = unsafe { std::slice::from_raw_parts(pages, n) };
+    let Some(first) = physical.pages.get(&page_slice[0]).cloned() else {
+        tracing::warn!(page = page_slice[0], "XMemMapPhysicalPages: unknown page");
+        flush_pending(&mut physical);
+        return std::ptr::null_mut();
+    };
+
+    let all_contiguous = (1..n).all(|k| {
+        physical
+            .pages
+            .get(&page_slice[k])
+            .is_some_and(|s| Arc::ptr_eq(&s.section, &first.section) && s.index == first.index + k)
+    });
+
+    // SAFETY: standard query of current thread ID.
+    let current_thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+    if let Some(ref mut pending) = physical.pending {
+        if pending.thread_id == current_thread
+            && base == pending.base + pending.n * PAGE
+            && Arc::ptr_eq(&first.section, &pending.slice.section)
+            && first.index == pending.slice.index + pending.n
+            && all_contiguous
+        {
+            pending.n += n;
+            return address;
         }
-        i += run;
     }
-    address
+
+    flush_pending(&mut physical);
+
+    if all_contiguous {
+        physical.pending = Some(PendingMap {
+            base,
+            n,
+            slice: first,
+            thread_id: current_thread,
+        });
+        address
+    } else {
+        let mut i = 0;
+        while i < n {
+            let Some(slice) = physical.pages.get(&page_slice[i]).cloned() else {
+                return std::ptr::null_mut();
+            };
+            let run = 1 + page_slice[i + 1..]
+                .iter()
+                .zip(1..)
+                .take_while(|&(page, k)| {
+                    physical.pages.get(page).is_some_and(|s| {
+                        Arc::ptr_eq(&s.section, &slice.section) && s.index == slice.index + k
+                    })
+                })
+                .count();
+            unmap(&mut physical, base + i * PAGE, run * PAGE);
+            if !map(&mut physical, base + i * PAGE, run * PAGE, slice) {
+                return std::ptr::null_mut();
+            }
+            i += run;
+        }
+        address
+    }
 }
 
 /// One page at each address; null `pages`, or a page number 0, unmaps
@@ -637,6 +737,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     if addresses.is_null() {
         return 0;
     }
+    flush_pending_mappings();
     let mut i = 0;
     while i < n {
         let addr = unsafe { *addresses.add(i) };
@@ -653,6 +754,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
                 }
             }
             if XMemMapPhysicalPages(addr, run, std::ptr::null()).is_null() {
+                flush_pending_mappings();
                 return 0;
             }
             i += run;
@@ -672,11 +774,13 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
             }
             let page_ptr = unsafe { pages.add(i) };
             if XMemMapPhysicalPages(addr, run, page_ptr).is_null() {
+                flush_pending_mappings();
                 return 0;
             }
             i += run;
         }
     }
+    flush_pending_mappings();
     1
 }
 
@@ -688,6 +792,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
+    flush_pending(&mut physical);
     unmap(&mut physical, to, len);
     if from == 0 {
         return true;
@@ -1186,6 +1291,46 @@ mod tests {
         assert_eq!(query(a).host.State, MEM_COMMIT);
         assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
         assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn physical_pages_coalesce_across_individual_calls() {
+        let pages = allocate(10);
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            10 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!a.is_null());
+        let at = |p: *mut c_void, page: usize| p.wrapping_byte_add(page * PAGE);
+
+        // 10 individual 1-page calls, contiguous in addresses and pages
+        for i in 0..10 {
+            assert_eq!(
+                XMemMapPhysicalPages(at(a, i), 1, pages[i..].as_ptr()),
+                at(a, i)
+            );
+        }
+
+        // Query flushes pending mapping and verifies commit
+        assert_eq!(query(a).host.State, MEM_COMMIT);
+
+        // Should coalesce into 1 single view of 10 pages rather than 10 individual views
+        let view = physical().views.get(&(a as usize)).map(|v| v.0);
+        assert_eq!(view, Some(10 * PAGE));
+
+        // Read/write works across the coalesced region
+        unsafe {
+            at(a, 0).cast::<u8>().write(42);
+            at(a, 9).cast::<u8>().write(99);
+            assert_eq!(at(a, 0).cast::<u8>().read(), 42);
+            assert_eq!(at(a, 9).cast::<u8>().read(), 99);
+        }
+
+        assert_eq!(XMemMapPhysicalPages(a, 10, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(10, pages.as_ptr()), 1);
     }
 
     /// `n` pages of one new allocation.
