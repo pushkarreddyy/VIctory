@@ -17,7 +17,7 @@ pub extern "system" fn GetModuleHandleW(name: *const u16) -> *mut c_void {
     if name.is_null() {
         return runtime::main_image().unwrap_or(0) as *mut c_void;
     }
-    find_module(&wide(name), false).unwrap_or_else(|| host::get_module_handle_w(name))
+    find_module(&wide(name), LoadKind::Query).unwrap_or_else(|| host::get_module_handle_w(name))
 }
 
 /// See [`GetModuleHandleW`].
@@ -25,7 +25,7 @@ pub extern "system" fn GetModuleHandleA(name: *const u8) -> *mut c_void {
     if name.is_null() {
         return runtime::main_image().unwrap_or(0) as *mut c_void;
     }
-    find_module(&narrow(name), false).unwrap_or_else(|| host::get_module_handle_a(name))
+    find_module(&narrow(name), LoadKind::Query).unwrap_or_else(|| host::get_module_handle_a(name))
 }
 
 /// A NUL-terminated string from the title.
@@ -106,8 +106,13 @@ pub extern "system" fn LoadLibraryExA(
     file: *mut c_void,
     flags: u32,
 ) -> *mut c_void {
+    let kind = if runs_code(flags) {
+        LoadKind::Code
+    } else {
+        LoadKind::Data
+    };
     if !name.is_null()
-        && let Some(handle) = find_module(&narrow(name), runs_code(flags))
+        && let Some(handle) = find_module(&narrow(name), kind)
     {
         return handle;
     }
@@ -120,8 +125,13 @@ pub extern "system" fn LoadLibraryExW(
     file: *mut c_void,
     flags: u32,
 ) -> *mut c_void {
+    let kind = if runs_code(flags) {
+        LoadKind::Code
+    } else {
+        LoadKind::Data
+    };
     if !name.is_null()
-        && let Some(handle) = find_module(&wide(name), runs_code(flags))
+        && let Some(handle) = find_module(&wide(name), kind)
     {
         return handle;
     }
@@ -290,11 +300,18 @@ fn handle(m: &HleModule) -> *mut c_void {
     m as *const HleModule as *mut c_void
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadKind {
+    Query,
+    Code,
+    Data,
+}
+
 /// The title's images and our console modules by name; `None` leaves the
 /// name to the host, which only DLLs `HostPolicy` passes through get (as at
-/// import binding); others fail. With `load`, a title DLL not mapped yet is
-/// mapped now.
-fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
+/// import binding); others fail. With `LoadKind::Code`, a title DLL not mapped yet is
+/// mapped now. With `LoadKind::Data`, host mapping is allowed as data.
+fn find_module(path: &str, kind: LoadKind) -> Option<*mut c_void> {
     let file = path.rsplit(['\\', '/']).next().unwrap_or(path);
     // As the Windows loader does, a name without extension means a DLL.
     let file = if file.contains('.') {
@@ -304,7 +321,7 @@ fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
     };
     // Loads go through the title DLL loader first: it waits for a DLL that
     // another thread is still initialising, as the Windows loader lock does.
-    if load {
+    if kind == LoadKind::Code {
         match runtime::load_title_dll(&file) {
             Ok(Some(base)) => return Some(base as *mut c_void),
             Ok(None) => {}
@@ -322,12 +339,12 @@ fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
     // DLLs the host has too are real host modules, whatever `--strict` says.
     let host_dll = HostPolicy::default().allows(&file);
     if !host_dll && let Some(m) = registry().iter().find(|m| m.serves(&file)) {
-        if load {
+        if kind == LoadKind::Code {
             tracing::info!(dll = file, "loaded as a pseudo module");
         }
         return Some(handle(m));
     }
-    if host_dll {
+    if host_dll || kind == LoadKind::Data {
         return None;
     }
     // Any other host DLL (wininet, urlmon, ...) is beyond what we guard, and
@@ -683,5 +700,13 @@ mod tests {
         let runtime = LoadLibraryA(c"xgameruntime.dll".as_ptr().cast());
         assert!(!runtime.is_null());
         assert_eq!(GetModuleHandleW(w("XGameRuntime.dll").as_ptr()), runtime);
+
+        #[cfg(windows)]
+        {
+            // Loading a host DLL outside HostPolicy as data (0x2) reaches host and returns non-null
+            let comctl = LoadLibraryExW(w("comctl32.dll").as_ptr(), std::ptr::null_mut(), 0x2);
+            assert!(!comctl.is_null());
+            assert_eq!(FreeLibrary(comctl), 1);
+        }
     }
 }
