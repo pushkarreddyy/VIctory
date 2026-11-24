@@ -184,6 +184,11 @@ fn show_config() -> Result<()> {
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }
+    check_config_policy(&cfg)
+}
+
+pub(crate) fn check_config_policy(cfg: &victory_core::Config) -> Result<()> {
+    let mut violations = 0;
     for p in cfg
         .game_dir
         .iter()
@@ -192,8 +197,13 @@ fn show_config() -> Result<()> {
     {
         if let Err(e) = victory_core::ensure_outside_repo(p) {
             println!("POLICY VIOLATION: {e}");
+            violations += 1;
         }
     }
+    anyhow::ensure!(
+        violations == 0,
+        "{violations} asset policy violation(s) found in configuration"
+    );
     Ok(())
 }
 
@@ -209,4 +219,37 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         "no paths given and none configured (see victory.example.toml)"
     );
     Ok(all)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_config_policy_rejects_violation() {
+        let inside = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let cfg = victory_core::Config {
+            source: None,
+            game_dir: Some(inside),
+            cache_dir: std::env::temp_dir(),
+            data_dir: std::env::temp_dir(),
+            test_titles: Vec::new(),
+        };
+        let res = check_config_policy(&cfg);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("violation"));
+    }
+
+    #[test]
+    fn check_config_policy_accepts_clean_config() {
+        let outside = std::env::temp_dir();
+        let cfg = victory_core::Config {
+            source: None,
+            game_dir: None,
+            cache_dir: outside.join("victory_cache"),
+            data_dir: outside.join("victory_data"),
+            test_titles: Vec::new(),
+        };
+        assert!(check_config_policy(&cfg).is_ok());
+    }
 }
