@@ -42,6 +42,7 @@ impl Default for HostPolicy {
             "api-ms-win-shcore-*",
             "msvcp_win.dll",
             "ole32.dll",
+            "oleaut32.dll",
             "advapi32.dll",
             "iphlpapi.dll",
             // The title's crash handler writes minidumps with it (loaded by name).
@@ -144,5 +145,34 @@ mod imp {
 mod imp {
     pub(super) fn resolve(_dll: &str, _symbol: &victory_pe::ImportSymbol) -> Option<usize> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_policy_allows_oleaut32() {
+        let policy = HostPolicy::default();
+        assert!(policy.allows("oleaut32.dll"));
+        assert!(policy.allows("OLEAUT32.DLL"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn default_policy_resolves_oleaut32_bstr_ordinals() {
+        let policy = HostPolicy::default();
+        // Ordinal 4: SysAllocStringLen, Ordinal 6: SysFreeString
+        let alloc_str = policy.resolve("oleaut32.dll", &ImportSymbol::Ordinal(4));
+        let free_str = policy.resolve("oleaut32.dll", &ImportSymbol::Ordinal(6));
+        assert!(
+            alloc_str.is_some(),
+            "SysAllocStringLen (ordinal 4) should resolve on Windows host"
+        );
+        assert!(
+            free_str.is_some(),
+            "SysFreeString (ordinal 6) should resolve on Windows host"
+        );
     }
 }
