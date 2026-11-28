@@ -2405,6 +2405,42 @@ pub(crate) mod tests {
 
     const S_ENDPGM: u32 = 0xBF81_0000;
 
+    #[test]
+    fn same_block_phis_are_compared_on_matching_edges_with_one_proof_step() {
+        let mov = |dst: u32, src: u32| 0x7e00_0200 | (dst << 17) | src;
+        let literal = |dst, value: u32| mov(dst, 128 + value);
+        let words: [u32; 13] = [
+            0xBF00_8000, // s_cmp_eq_i32 s0, 0
+            0xBF84_0004, // s_cbranch_scc0 to the second arm
+            literal(4, 11),
+            literal(5, 11),
+            literal(6, 22),
+            0xBF82_0003, // s_branch to the join
+            literal(4, 22),
+            literal(5, 22),
+            literal(6, 11),
+            mov(8, 256 + 4),
+            mov(9, 256 + 5),
+            mov(10, 256 + 6),
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let lanes = lanes(&p).expect("the diamond structures");
+        let join = p.blocks.iter().find(|b| b.preds.len() == 2).unwrap();
+        let value = |reg| {
+            let phi = join.phis.iter().find(|phi| phi.reg == Reg::V(reg)).unwrap();
+            Term::Value(phi.value)
+        };
+        let (a, b, swapped) = (value(4), value(5), value(6));
+        assert_ne!(a, b, "the equal operands have two distinct SSA phis");
+        let tracer = Tracer::new(&p, &[], HwStage::Cs, Some(&lanes)).unwrap();
+        let known = Known::new();
+        assert!(!tracer.same_under(a, swapped, &known, 0));
+        // A nested proof can reach this join with only one step left.
+        assert!(tracer.same_under(a, b, &known, MAX_JOINS - 2));
+    }
+
     fn track_words(words: &[u32], layout: &[RootParam], stage: HwStage) -> Resources {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let p = crate::ir::build(&code, false, 256).unwrap();
